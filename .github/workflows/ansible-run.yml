@@ -82,7 +82,14 @@ jobs:
             -o BatchMode=yes "student@$RUN_HOST" true 2>&1 | tee ../ansible-logs/08-password-refused.log
           echo "password-only exit code: $?"
           set -e
-          curl -sS --fail "http://$RUN_HOST/health" 2>&1 | tee ../ansible-logs/09-curl-health.log
+          for i in $(seq 1 15); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "http://$RUN_HOST/health" || true)"
+            if [ "$code" = "200" ]; then break; fi
+            sleep 1
+          done
+          curl -sS "http://$RUN_HOST/health" 2>&1 | tee ../ansible-logs/09-curl-health.log
+          echo "HTTP $code" >> ../ansible-logs/09-curl-health.log
+          if [ "$code" != "200" ]; then exit 1; fi
           curl -sS --fail "http://$RUN_HOST/" 2>&1 | tee ../ansible-logs/10-curl-index.log
           ssh -i "$SSH_KEY" -o BatchMode=yes "devops@$RUN_HOST" \
             "sudo ss -tlnp | grep -E ':(22|80|5000)\b'; docker ps; sudo ufw status verbose" \
@@ -107,7 +114,16 @@ jobs:
           curl -sS -i "http://$RUN_HOST/health" 2>&1 | tee ../ansible-logs/14-drift-502.log
           ansible-playbook site.yml -e "ansible_host=$RUN_HOST" \
             -e "ansible_private_key_file=$SSH_KEY" 2>&1 | tee ../ansible-logs/15-drift-fixed.log
-          curl -sS --fail "http://$RUN_HOST/health" 2>&1 | tee ../ansible-logs/16-drift-health.log
+          ssh -i "$SSH_KEY" -o BatchMode=yes "devops@$RUN_HOST" \
+            "grep proxy_pass /etc/nginx/sites-available/devops-ci-app; docker ps --filter name=devops-ci-app; sudo ss -tlnp | grep ':5000'" \
+            2>&1 | tee ../ansible-logs/15b-drift-state.log
+          for i in $(seq 1 15); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "http://$RUN_HOST/health" || true)"
+            if [ "$code" = "200" ]; then break; fi
+            sleep 1
+          done
+          echo "HTTP $code after drift recovery" | tee ../ansible-logs/16-drift-health.log
+          if [ "$code" != "200" ]; then exit 1; fi
 
       - name: Incident 2 - unavailable new tag keeps old container
         run: |
@@ -126,6 +142,7 @@ jobs:
           fi
           echo "Expected playbook failure with exit code $bad_tag_rc"
           curl -sS --fail "http://$RUN_HOST/health" 2>&1 | tee ../ansible-logs/18-badtag-service.log
+          echo "HTTP $(curl -s -o /dev/null -w '%{http_code}' "http://$RUN_HOST/health")" >> ../ansible-logs/18-badtag-service.log
           ssh -i "$SSH_KEY" -o BatchMode=yes "devops@$RUN_HOST" \
             "docker ps --filter name=devops-ci-app" 2>&1 | tee ../ansible-logs/19-badtag-container.log
           cp /tmp/all.yml.good group_vars/all.yml
@@ -157,7 +174,14 @@ jobs:
           echo "Expected audit failure with exit code $verify_rc"
           ansible-playbook site.yml -e "ansible_host=$RUN_HOST" \
             -e "ansible_private_key_file=$SSH_KEY" 2>&1 | tee ../ansible-logs/25-verify-restored.log
-          curl -sS --fail "http://$RUN_HOST/health" 2>&1 | tee ../ansible-logs/26-final-health.log
+          for i in $(seq 1 15); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "http://$RUN_HOST/health" || true)"
+            if [ "$code" = "200" ]; then break; fi
+            sleep 1
+          done
+          curl -sS "http://$RUN_HOST/health" 2>&1 | tee ../ansible-logs/26-final-health.log
+          echo "HTTP $code" >> ../ansible-logs/26-final-health.log
+          if [ "$code" != "200" ]; then exit 1; fi
 
       - name: Final state
         run: |
