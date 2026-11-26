@@ -1,0 +1,211 @@
+name: Ansible deployment validation
+
+# Адаптация окружения: локальной VM/WSL нет, поэтому один GitHub-hosted runner
+# совмещает управляющий и управляемый узлы и подключается к самому себе по SSH.
+on:
+  workflow_dispatch:
+  push:
+    branches: [feature/ansible]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    env:
+      SSH_KEY: /home/runner/.ssh/devops_vm
+      RUN_HOST: 127.0.0.1
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: feature/ansible
+
+      - name: Prepare control node
+        run: |
+          set -eo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ansible sshpass openssh-server
+          ansible --version | head -3
+          sshpass -V | head -1
+          ansible-galaxy collection install -r ansible/requirements.yml
+          ansible-galaxy collection list | grep -E 'ansible.posix|community.docker|community.general'
+
+      - name: Prepare managed node over loopback
+        run: |
+          set -eo pipefail
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          ssh-keygen -q -t ed25519 -N '' -f "$SSH_KEY"
+          chmod 600 "$SSH_KEY"
+          STUDENT_PASSWORD="$(openssl rand -hex 12)"
+          echo "::add-mask::$STUDENT_PASSWORD"
+          echo "STUDENT_PASSWORD=$STUDENT_PASSWORD" >> "$GITHUB_ENV"
+          sudo useradd -m -s /bin/bash student
+          echo "student:$STUDENT_PASSWORD" | sudo chpasswd
+          sudo usermod -aG sudo student
+          sudo systemctl start ssh
+          sudo systemctl is-active ssh
+          ssh-keyscan -H "$RUN_HOST" >> "$HOME/.ssh/known_hosts"
+          echo "Student account and sshd are ready; password is masked."
+
+      - name: Syntax and inventory checks
+        run: |
+          set -eo pipefail
+          mkdir -p ansible-logs
+          cd ansible
+          ansible-inventory -i inventory/bootstrap.ini --graph 2>&1 | tee ../ansible-logs/01-inventory-bootstrap.log
+          ansible-inventory --graph 2>&1 | tee ../ansible-logs/02-inventory-prod.log
+          ansible-playbook -i inventory/bootstrap.ini site.yml --syntax-check 2>&1 | tee ../ansible-logs/03-syntax-bootstrap.log
+          ansible-playbook site.yml --syntax-check 2>&1 | tee ../ansible-logs/04-syntax-prod.log
+
+      - name: Bootstrap from student by password
+        run: |
+          set -eo pipefail
+          cd ansible
+          printf '%s\n%s\n' "$STUDENT_PASSWORD" "$STUDENT_PASSWORD" |
+            ansible-playbook -i inventory/bootstrap.ini site.yml \
+              --ask-pass --ask-become-pass -e "ansible_host=$RUN_HOST" \
+              2>&1 | tee ../ansible-logs/05-bootstrap.log
+
+      - name: Verify key access, firewall and HTTP chain
+        run: |
+          set -eo pipefail
+          cd ansible
+          ssh -i "$SSH_KEY" -o BatchMode=yes "devops@$RUN_HOST" \
+            "whoami && sudo -n true && echo sudo-ok" 2>&1 | tee ../ansible-logs/06-key-access.log
+          ansible all -m ping -e "ansible_host=$RUN_HOST" \
+            -e "ansible_private_key_file=$SSH_KEY" 2>&1 | tee ../ansible-logs/07-ansible-ping.log
+          set +e
+          ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+            -o BatchMode=yes "student@$RUN_HOST" true 2>&1 | tee ../ansible-logs/08-password-refused.log
+          echo "password-only exit code: $?"
+          set -e
+          for i in $(seq 1 15); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "http://$RUN_HOST/health" || true)"
+            if [ "$code" = "200" ]; then break; fi
+            sleep 1
+          done
+          curl -sS "http://$RUN_HOST/health" 2>&1 | tee ../ansible-logs/09-curl-health.log
+          echo "HTTP $code" >> ../ansible-logs/09-curl-health.log
+          if [ "$code" != "200" ]; then exit 1; fi
+          curl -sS --fail "http://$RUN_HOST/" 2>&1 | tee ../ansible-logs/10-curl-index.log
+          ssh -i "$SSH_KEY" -o BatchMode=yes "devops@$RUN_HOST" \
+            "sudo ss -tlnp | grep -E ':(22|80|5000)\b'; docker ps; sudo ufw status verbose" \
+            2>&1 | tee ../ansible-logs/11-node-state.log
+
+      - name: Second run must be idempotent
+        run: |
+          set -eo pipefail
+          cd ansible
+          ansible-playbook site.yml -e "ansible_host=$RUN_HOST" \
+            -e "ansible_private_key_file=$SSH_KEY" 2>&1 | tee ../ansible-logs/12-idempotent.log
+          grep -q 'changed=0' ../ansible-logs/12-idempotent.log
+          grep -q 'failed=0' ../ansible-logs/12-idempotent.log
+
+      - name: Incident 1 - manual drift and playbook recovery
+        run: |
+          set -eo pipefail
+          cd ansible
+          ssh -i "$SSH_KEY" -o BatchMode=yes "devops@$RUN_HOST" \
+            "docker rm -f devops-ci-app; sudo sed -i 's/127.0.0.1:5000/127.0.0.1:5001/' /etc/nginx/sites-available/devops-ci-app; sudo nginx -t && sudo systemctl reload nginx" \
+            2>&1 | tee ../ansible-logs/13-drift-inject.log
+          curl -sS -i "http://$RUN_HOST/health" 2>&1 | tee ../ansible-logs/14-drift-502.log
+          ansible-playbook site.yml -e "ansible_host=$RUN_HOST" \
+            -e "ansible_private_key_file=$SSH_KEY" 2>&1 | tee ../ansible-logs/15-drift-fixed.log
+          ssh -i "$SSH_KEY" -o BatchMode=yes "devops@$RUN_HOST" \
+            "grep proxy_pass /etc/nginx/sites-available/devops-ci-app; docker ps --filter name=devops-ci-app; sudo ss -tlnp | grep ':5000'" \
+            2>&1 | tee ../ansible-logs/15b-drift-state.log
+          for i in $(seq 1 15); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "http://$RUN_HOST/health" || true)"
+            if [ "$code" = "200" ]; then break; fi
+            sleep 1
+          done
+          echo "HTTP $code after drift recovery" | tee ../ansible-logs/16-drift-health.log
+          if [ "$code" != "200" ]; then exit 1; fi
+
+      - name: Incident 2 - unavailable new tag keeps old container
+        run: |
+          set -eo pipefail
+          cd ansible
+          cp group_vars/all.yml /tmp/all.yml.good
+          sed -i 's|^app_tag: .*|app_tag: "0000000000000000000000000000000000000000"|' group_vars/all.yml
+          set +e
+          ansible-playbook site.yml -e "ansible_host=$RUN_HOST" \
+            -e "ansible_private_key_file=$SSH_KEY" 2>&1 | tee ../ansible-logs/17-badtag-fail.log
+          bad_tag_rc=$?
+          set -e
+          if [ "$bad_tag_rc" -eq 0 ]; then
+            echo "ERROR: playbook with nonexistent tag unexpectedly succeeded"
+            exit 1
+          fi
+          echo "Expected playbook failure with exit code $bad_tag_rc"
+          curl -sS --fail "http://$RUN_HOST/health" 2>&1 | tee ../ansible-logs/18-badtag-service.log
+          echo "HTTP $(curl -s -o /dev/null -w '%{http_code}' "http://$RUN_HOST/health")" >> ../ansible-logs/18-badtag-service.log
+          ssh -i "$SSH_KEY" -o BatchMode=yes "devops@$RUN_HOST" \
+            "docker ps --filter name=devops-ci-app" 2>&1 | tee ../ansible-logs/19-badtag-container.log
+          cp /tmp/all.yml.good group_vars/all.yml
+          ansible-playbook site.yml -e "ansible_host=$RUN_HOST" \
+            -e "ansible_private_key_file=$SSH_KEY" 2>&1 | tee ../ansible-logs/20-badtag-restored.log
+          grep -q 'changed=0' ../ansible-logs/20-badtag-restored.log
+
+      - name: Read-only audit and negative test
+        run: |
+          set -eo pipefail
+          cd ansible
+          ansible-playbook verify.yml -e "ansible_host=$RUN_HOST" \
+            -e "ansible_private_key_file=$SSH_KEY" 2>&1 | tee ../ansible-logs/21-verify-1.log
+          grep -q 'changed=0' ../ansible-logs/21-verify-1.log
+          ansible-playbook verify.yml -e "ansible_host=$RUN_HOST" \
+            -e "ansible_private_key_file=$SSH_KEY" 2>&1 | tee ../ansible-logs/22-verify-2.log
+          grep -q 'changed=0' ../ansible-logs/22-verify-2.log
+          ssh -i "$SSH_KEY" -o BatchMode=yes "devops@$RUN_HOST" \
+            "docker stop devops-ci-app" 2>&1 | tee ../ansible-logs/23-verify-stop.log
+          set +e
+          ansible-playbook verify.yml -e "ansible_host=$RUN_HOST" \
+            -e "ansible_private_key_file=$SSH_KEY" 2>&1 | tee ../ansible-logs/24-verify-negative.log
+          verify_rc=$?
+          set -e
+          if [ "$verify_rc" -eq 0 ]; then
+            echo "ERROR: read-only audit did not detect stopped container"
+            exit 1
+          fi
+          echo "Expected audit failure with exit code $verify_rc"
+          ansible-playbook site.yml -e "ansible_host=$RUN_HOST" \
+            -e "ansible_private_key_file=$SSH_KEY" 2>&1 | tee ../ansible-logs/25-verify-restored.log
+          for i in $(seq 1 15); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "http://$RUN_HOST/health" || true)"
+            if [ "$code" = "200" ]; then break; fi
+            sleep 1
+          done
+          curl -sS "http://$RUN_HOST/health" 2>&1 | tee ../ansible-logs/26-final-health.log
+          echo "HTTP $code" >> ../ansible-logs/26-final-health.log
+          if [ "$code" != "200" ]; then exit 1; fi
+
+      - name: Final state
+        run: |
+          set -eo pipefail
+          ssh -i "$SSH_KEY" -o BatchMode=yes "devops@$RUN_HOST" \
+            "docker --version; docker inspect --format '{{.Config.Image}} {{.State.Status}}' devops-ci-app; sudo ss -tlnp | grep -E ':(22|80|5000)\b'; sshd -T | grep -E '^(passwordauthentication|permitrootlogin) '; sudo ufw status verbose" \
+            2>&1 | tee ansible-logs/27-final-state.log
+          git status --short
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ansible-logs-${{ github.run_id }}
+          path: ansible-logs/
+          if-no-files-found: warn
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Ansible validation recap"
+            for f in ansible-logs/*.log; do
+              echo "### $(basename "$f")"
+              grep -E 'RECAP|changed=|failed=|fatal:|HTTP/|status|Permission denied|exit code' "$f" | tail -6 || true
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
