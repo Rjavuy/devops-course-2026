@@ -176,3 +176,74 @@
 ### 9.8 Проверка
 
 Раздел `[5] Контейнеризация` сценария `scripts/audit.sh`: служба `docker` активна; контейнер `app-db-1` в состоянии `healthy`; порты 5000 и 5432 прослушиваются только на `127.0.0.1`; права `~/app/.env` равны `600`.
+
+
+## 10. Ansible
+
+### 10.1 Расположение и узлы
+
+- Проект: `ansible/` в репозитории `Rjavuy/devops-course-2026`, ветка `feature/ansible`.
+- Управляющий узел (control): хостовая система с Linux/WSL и Ansible 2.16+; коллекции устанавливаются из `ansible/requirements.yml`.
+- Управляемый узел (managed): `devops-vm`, Ubuntu Server 24.04 amd64, Host-only адрес `192.168.56.101`, SSH порт 22.
+- Модули выполняются на управляемом узле через SSH; постоянный агент не требуется. Коллекции `ansible.posix`, `community.docker`, `community.general` устанавливаются на управляющем узле, а `python3-debian` и `python3-requests` — на управляемом.
+
+### 10.2 Inventory и учётные записи
+
+| Файл | Пользователь | Аутентификация | Когда используется |
+|------|--------------|----------------|--------------------|
+| `ansible/inventory/bootstrap.ini` | `student` | пароль, `--ask-pass --ask-become-pass` | первичный запуск на чистой VM |
+| `ansible/inventory/prod.ini` | `devops` | ключ `~/.ssh/devops_vm` | все последующие запуски и аудит |
+
+Открытый ключ `~/.ssh/devops_vm.pub` читается ролью `ssh`; закрытый ключ хранится только на управляющем узле с правами `0600` и не включается в репозиторий. После установки ключа SSH hardening отключает парольную аутентификацию, поэтому повторный запуск по `student` невозможен и не нужен.
+
+### 10.3 Роли
+
+| Роль | Ответственность |
+|------|-----------------|
+| `base` | проверка Ubuntu 24.04 amd64, базовые пакеты, официальный репозиторий Docker, Docker Engine |
+| `ssh` | пользователь `devops`, SSH-ключ, NOPASSWD sudo, hardening SSH, UFW |
+| `nginx` | reverse proxy на порт приложения, отключение default site, `nginx -t` перед reload |
+| `app` | загрузка образа по SHA, контейнер с port binding на loopback, проверка `/health` |
+
+`ansible.cfg` содержит `force_handlers = True`: уведомлённые handlers SSH и Nginx выполняются даже при отказе более поздней задачи роли `app`.
+
+### 10.4 Приложение
+
+- Образ: `ghcr.io/rjavuy/devops-ci-app` (публичный пакет из практической работы № 10).
+- Тег: полный SHA `7dac688e5bdb14d7568977fdf1080b67731ce354`; `latest` не используется.
+- Контейнер: `devops-ci-app`, порт контейнера `5000`, публикация `127.0.0.1:5000:5000`.
+- Проверка: `GET http://127.0.0.1:5000/health` → `{"status": "ok"}`; внешний запрос идёт через Nginx `http://192.168.56.101/health`.
+
+### 10.5 Команды
+
+Первичный запуск (интерактивный ввод пароля `student` на два запроса):
+
+```
+cd ansible
+ansible-playbook -i inventory/bootstrap.ini site.yml --ask-pass --ask-become-pass
+```
+
+Проверка перехода на ключ и неинтерактивный доступ:
+
+```
+ssh -i ~/.ssh/devops_vm devops@192.168.56.101 "whoami && sudo -n true && echo sudo-ok"
+ansible all -m ping
+```
+
+Повторный запуск идемпотентного конвейера (ожидается `changed=0`, `failed=0`):
+
+```
+cd ansible
+ansible-playbook site.yml
+```
+
+Read-only аудит из CI (не меняет конфигурацию, ожидается `changed=0`):
+
+```
+cd ansible
+ansible-playbook verify.yml
+```
+
+### 10.6 Адаптация окружения для проверки
+
+На учебном хосте отсутствуют VirtualBox, WSL и локальный Docker, поэтому проверка ролей выполнялась на GitHub-hosted runner `ubuntu-24.04`, который совмещал управляющий и управляемый узлы через SSH-loopback (`127.0.0.1`). Файлы `bootstrap.ini` и `prod.ini` сохранили адрес VM `192.168.56.101`; runner получал адрес через `-e ansible_host=127.0.0.1`. Логи всех запусков и инцидентов загружаются артефактом workflow `.github/workflows/ansible-run.yml`.
