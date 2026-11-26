@@ -45,7 +45,7 @@
     group: root
     mode: "0644"
     validate: "sshd -t -f %s"
-    notify: Restart SSH
+  notify: Restart SSH
 
 - name: Allow management and web ports
   community.general.ufw:

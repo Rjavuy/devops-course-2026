@@ -13,20 +13,20 @@
     owner: root
     group: root
     mode: "0644"
-    notify: Reload Nginx
+  notify: Reload Nginx
 
 - name: Disable default site
   ansible.builtin.file:
     path: /etc/nginx/sites-enabled/default
     state: absent
-    notify: Reload Nginx
+  notify: Reload Nginx
 
 - name: Enable application site
   ansible.builtin.file:
     src: /etc/nginx/sites-available/devops-ci-app
     dest: /etc/nginx/sites-enabled/devops-ci-app
     state: link
-    notify: Reload Nginx
+  notify: Reload Nginx
 
 - name: Enable Nginx service
   ansible.builtin.service:
