@@ -4,6 +4,8 @@ name: Ansible deployment validation
 # совмещает управляющий и управляемый узлы и подключается к самому себе по SSH.
 on:
   workflow_dispatch:
+  push:
+    branches: [feature/ansible]
 
 permissions:
   contents: read
